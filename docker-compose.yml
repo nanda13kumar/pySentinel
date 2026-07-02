@@ -1,0 +1,53 @@
+# ==============================================================================
+#  PySentinel — docker-compose.yml
+#
+#  Usage:
+#    docker compose run --rm pysentinel nsepython
+#    docker compose run --rm pysentinel https://github.com/aeron7/nsepython
+#    docker compose run --rm pysentinel nsepython --html
+#
+#  Or set TARGET in your shell:
+#    TARGET=nsepython docker compose run --rm pysentinel
+# ==============================================================================
+
+services:
+  pysentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pysentinel:2.1
+
+    # ── Report output ──────────────────────────────────────────────────────────
+    # Reports land in ./reports/ on your host machine
+    volumes:
+      - ./reports:/home/scanner/pysentinel_reports
+
+    # ── Security hardening ─────────────────────────────────────────────────────
+    # cap_drop: strip all Linux capabilities (scanner doesn't need any)
+    # security_opt: no-new-privileges prevents privilege escalation
+    # read_only: container filesystem is read-only (writes only to /tmp + reports)
+    # tmpfs: /tmp is in-memory — all scan temp files evaporate when container stops
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+
+    # ── Resource limits ────────────────────────────────────────────────────────
+    # Prevents a malicious package from exhausting host resources during scan
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+
+    # ── Default target (override on CLI) ──────────────────────────────────────
+    # docker compose run --rm pysentinel requests
+    # or: TARGET=requests docker compose run --rm pysentinel $TARGET
