@@ -52,12 +52,25 @@ VENV_DIR="$SCAN_ROOT/.venv"
 DOWNLOAD_DIR="$SCAN_ROOT/download"
 TOOLS_LOG="$SCAN_ROOT/tools.log"
 
+# ── Structured-report data files (consumed by reporter/generate_report.py) ────
+CUSTOM_FINDINGS_JSONL="$SCAN_ROOT/custom_findings.jsonl"
+PYPI_META_JSON="$SCAN_ROOT/pypi_meta.json"
+VERDICT_JSON="$SCAN_ROOT/verdict.json"
+GITLEAKS_JSON="$SCAN_ROOT/gitleaks.json"
+export CUSTOM_FINDINGS_JSONL
+: > "$CUSTOM_FINDINGS_JSONL"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_REPORTER_DIR="$(cd "$SCRIPT_DIR/../reporter" 2>/dev/null && pwd || true)"
+
+START_EPOCH=$(date +%s)
+STARTED_AT_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
 # ── Counters (issue severity buckets) ─────────────────────────────────────────
 CRITICAL=0
 HIGH=0
 MEDIUM=0
 LOW=0
-FINDINGS_JSON="[]"   # Will be built up as JSON for HTML report
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'; LRED='\033[1;31m'
@@ -128,6 +141,49 @@ rg_exists() {
     else
         grep -rql "$pattern" "$dir" --include="*.py" 2>/dev/null
     fi
+}
+
+# record_finding: append one structured finding to CUSTOM_FINDINGS_JSONL.
+# Values are passed via env vars (never string-interpolated into the python
+# source) so file paths / matched code can contain any characters safely.
+# Usage: record_finding <category> <severity> <pattern> <description> <file> <line> <line_content>
+record_finding() {
+    local category="$1" severity="$2" pattern="$3" description="$4"
+    local file="$5" line="$6" content="$7"
+    CATEGORY="$category" SEVERITY="$severity" PATTERN="$pattern" DESCRIPTION="$description" \
+    FFILE="$file" FLINE="$line" FCONTENT="$content" \
+    python3_run -c "
+import json, os
+rec = {
+    'category': os.environ.get('CATEGORY', ''),
+    'severity': os.environ.get('SEVERITY', ''),
+    'pattern': os.environ.get('PATTERN', ''),
+    'description': os.environ.get('DESCRIPTION', ''),
+    'file': os.environ.get('FFILE', ''),
+    'line_number': int(os.environ['FLINE']) if os.environ.get('FLINE', '').strip().isdigit() else None,
+    'line_content': os.environ.get('FCONTENT', ''),
+}
+with open(os.environ['CUSTOM_FINDINGS_JSONL'], 'a') as fh:
+    fh.write(json.dumps(rec) + chr(10))
+" 2>>"$TOOLS_LOG" || true
+}
+
+# record_hits: parse ripgrep/grep "file:line:content" output lines and
+# record one finding per hit.
+# Usage: record_hits <category> <severity> <pattern> <description> <hits-text>
+record_hits() {
+    local category="$1" severity="$2" pattern="$3" description="$4" hits="$5"
+    [[ -z "$hits" ]] && return 0
+    local hit f rest ln content
+    while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        f="${hit%%:*}"
+        rest="${hit#*:}"
+        ln="${rest%%:*}"
+        content="${rest#*:}"
+        f="${f#"$SOURCE_DIR"/}"
+        record_finding "$category" "$severity" "$pattern" "$description" "$f" "$ln" "$content"
+    done <<< "$hits"
 }
 
 # ==============================================================================
@@ -241,6 +297,7 @@ if [[ "$INPUT" == *"github.com"* ]]; then
     IS_GITHUB=true
     GITHUB_URL="${INPUT%.git}"   # strip trailing .git if present
     PACKAGE_NAME=$(basename "$GITHUB_URL")
+    TARGET_URL="$GITHUB_URL"
     log "Detected GitHub URL → $GITHUB_URL"
     if $HAS_GITLEAKS; then
         log "Cloning FULL history (required for gitleaks git-history scan) …"
@@ -255,6 +312,7 @@ if [[ "$INPUT" == *"github.com"* ]]; then
     fi
 else
     PACKAGE_NAME="$INPUT"
+    TARGET_URL="https://pypi.org/project/${PACKAGE_NAME}/"
     log "Detected PyPI package → $PACKAGE_NAME"
 
     # Verify package exists on PyPI
@@ -308,6 +366,8 @@ try:
         data = json.load(r)
 except Exception as e:
     print(f"  [skip] PyPI metadata unavailable: {e}")
+    with open("$PYPI_META_JSON", "w") as f:
+        json.dump({"pypi_info": {}, "metadata_flags": []}, f)
     raise SystemExit(0)
 
 info = data["info"]
@@ -349,6 +409,22 @@ if flags:
         print(f"    ! {f}")
 else:
     print("\n  ✓ Metadata looks healthy")
+
+with open("$PYPI_META_JSON", "w") as f:
+    json.dump({
+        "pypi_info": {
+            "name": info.get("name"),
+            "version": latest,
+            "author": info.get("author"),
+            "license": info.get("license"),
+            "summary": info.get("summary"),
+            "home_page": info.get("home_page"),
+            "total_releases": len(all_versions),
+            "requires_python": info.get("requires_python"),
+            "requires_dist": deps,
+        },
+        "metadata_flags": flags,
+    }, f)
 PYEOF
 
 # ==============================================================================
@@ -359,6 +435,7 @@ section "STEP 4: Install-Hook Analysis (setup.py / pyproject.toml)"
 analyze_install_hooks() {
     local file="$1"
     local label="$2"
+    local rel="${file#"$SOURCE_DIR"/}"
 
     declare -a HOOK_PATTERNS=(
         "cmdclass"
@@ -383,6 +460,11 @@ analyze_install_hooks() {
         if grep -qP "$p" "$file" 2>/dev/null; then
             high_f "${label}: suspicious pattern → ${p}"
             found=1
+            local match_line match_content
+            match_line=$(grep -nP "$p" "$file" 2>/dev/null | head -1 | cut -d: -f1)
+            match_content=$(grep -m1 -P "$p" "$file" 2>/dev/null | sed -e 's/^[[:space:]]*//')
+            record_finding "install-hook" "HIGH" "$p" "${label}: suspicious install-hook pattern" \
+                "$rel" "${match_line:-}" "${match_content:-}"
         fi
     done
     [[ $found -eq 0 ]] && ok "${label}: no suspicious install-hook patterns"
@@ -423,6 +505,7 @@ for pat in "${!OBF_PATTERNS[@]}"; do
     if [[ -n "$hits" ]]; then
         high_f "${OBF_PATTERNS[$pat]}"
         echo "$hits" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+        record_hits "obfuscation" "HIGH" "$pat" "${OBF_PATTERNS[$pat]}" "$hits"
         OBF_FOUND=1
     fi
 done
@@ -457,6 +540,7 @@ for pat in "${!NET_PATTERNS[@]}"; do
     if [[ -n "$hits" ]]; then
         warn "${NET_PATTERNS[$pat]} ($pat)"
         echo "$hits" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+        record_hits "network" "MEDIUM" "$pat" "${NET_PATTERNS[$pat]}" "$hits"
         NET_FOUND=1
     fi
 done
@@ -478,6 +562,7 @@ fi
 if [[ -n "$HARDCODED_IPS" ]]; then
     high_f "Hardcoded IP addresses found:"
     echo "$HARDCODED_IPS" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+    record_hits "network" "HIGH" "hardcoded-ip" "Hardcoded IP address" "$HARDCODED_IPS"
 fi
 
 [[ $NET_FOUND -eq 0 && -z "${HARDCODED_IPS:-}" ]] && ok "No suspicious outbound network patterns found"
@@ -525,6 +610,7 @@ for pat in "${!CRIT_FS_PATTERNS[@]}"; do
     if [[ -n "$hits" ]]; then
         crit_f "${CRIT_FS_PATTERNS[$pat]}"
         echo "$hits" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+        record_hits "filesystem" "CRITICAL" "$pat" "${CRIT_FS_PATTERNS[$pat]}" "$hits"
         FS_FOUND=1
     fi
 done
@@ -533,6 +619,7 @@ for pat in "${!HIGH_FS_PATTERNS[@]}"; do
     if [[ -n "$hits" ]]; then
         high_f "${HIGH_FS_PATTERNS[$pat]}"
         echo "$hits" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+        record_hits "filesystem" "HIGH" "$pat" "${HIGH_FS_PATTERNS[$pat]}" "$hits"
         FS_FOUND=1
     fi
 done
@@ -541,6 +628,7 @@ for pat in "${!MED_FS_PATTERNS[@]}"; do
     if [[ -n "$hits" ]]; then
         warn "${MED_FS_PATTERNS[$pat]}"
         echo "$hits" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+        record_hits "filesystem" "MEDIUM" "$pat" "${MED_FS_PATTERNS[$pat]}" "$hits"
         FS_FOUND=1
     fi
 done
@@ -590,7 +678,6 @@ if ! $HAS_GITLEAKS; then
     echo "    This step catches secrets deleted from code but still in git log." | tee -a "$REPORT_TXT"
     echo "    Install gitleaks and re-run for a complete scan." | tee -a "$REPORT_TXT"
 else
-    GITLEAKS_JSON="$SCAN_ROOT/gitleaks.json"
     GITLEAKS_EXIT=0
 
     # If we have a real git repo (GitHub input or PyPI pkg with embedded .git)
@@ -842,7 +929,7 @@ log "Checking __init__.py files for top-level executable side-effects …"
 find "$SOURCE_DIR" -name "__init__.py" | while IFS= read -r init_file; do
     rel_path="${init_file#$SOURCE_DIR/}"
     python3_run - <<PYEOF 2>/dev/null | tee -a "$REPORT_TXT"
-import ast
+import ast, json, os
 
 path = "$init_file"
 rel  = "$rel_path"
@@ -868,14 +955,27 @@ for node in ast.walk(tree):
     if isinstance(node, ast.Call):
         func = node.func
         if isinstance(func, ast.Name) and func.id in DANGER_NAMES:
-            side_effects.append(f"line {node.lineno}: {func.id}()")
+            side_effects.append((node.lineno, f"{func.id}()"))
         elif isinstance(func, ast.Attribute) and func.attr in CALL_ATTRS:
-            side_effects.append(f"line {node.lineno}: .{func.attr}()")
+            side_effects.append((node.lineno, f".{func.attr}()"))
 
 if side_effects:
     print(f"  ⚠  {rel}: executable side-effects on import:")
-    for se in side_effects[:8]:
-        print(f"      {se}")
+    for lineno, se in side_effects[:8]:
+        print(f"      line {lineno}: {se}")
+    jsonl = os.environ.get("CUSTOM_FINDINGS_JSONL")
+    if jsonl:
+        with open(jsonl, "a") as fh:
+            for lineno, se in side_effects[:8]:
+                fh.write(json.dumps({
+                    "category": "obfuscation",
+                    "severity": "MEDIUM",
+                    "pattern": "init-side-effect",
+                    "description": "Executable side-effect on import in __init__.py",
+                    "file": rel,
+                    "line_number": lineno,
+                    "line_content": se,
+                }) + "\n")
 else:
     print(f"  ✓  {rel}: clean")
 PYEOF
@@ -898,16 +998,92 @@ UNUSUAL=$(find "$SOURCE_DIR" -type f \( \
 if [[ -n "$SHELL_SCRIPTS" ]]; then
     warn "Shell scripts found (review them manually):"
     echo "$SHELL_SCRIPTS" | sed "s|$SOURCE_DIR/||" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+    while IFS= read -r sfile; do
+        [[ -z "$sfile" ]] && continue
+        record_finding "other" "LOW" "shell-script" "Shell script present — review manually" \
+            "${sfile#"$SOURCE_DIR"/}" "" ""
+    done <<< "$SHELL_SCRIPTS"
 fi
 if [[ -n "$ELF_BINS" ]]; then
     high_f "Compiled native binaries found:"
     echo "$ELF_BINS" | sed "s|$SOURCE_DIR/||" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+    while IFS= read -r bline; do
+        [[ -z "$bline" ]] && continue
+        bpath="${bline%%:*}"
+        record_finding "other" "HIGH" "native-binary" "Compiled native binary found" \
+            "${bpath#"$SOURCE_DIR"/}" "" "$bline"
+    done <<< "$ELF_BINS"
 fi
 if [[ -n "$UNUSUAL" ]]; then
     warn "Compiled Python or native extension files (.so/.dll/.dylib):"
     echo "$UNUSUAL" | sed "s|$SOURCE_DIR/||" | sed 's/^/    /' | tee -a "$REPORT_TXT"
+    while IFS= read -r ufile; do
+        [[ -z "$ufile" ]] && continue
+        record_finding "other" "MEDIUM" "compiled-extension" "Compiled/extension file present" \
+            "${ufile#"$SOURCE_DIR"/}" "" ""
+    done <<< "$UNUSUAL"
 fi
 [[ -z "$SHELL_SCRIPTS$ELF_BINS$UNUSUAL" ]] && ok "No shell scripts or compiled binaries found"
+
+# ==============================================================================
+#  STEP 14b: Consolidate tool findings into verdict scoring
+#  WHY: Bandit/Semgrep/pip-audit/detect-secrets/gitleaks findings were only
+#  ever printed to the report — they never fed the CRITICAL/HIGH/MEDIUM/LOW
+#  counters used for the final verdict, so a package riddled with CVEs or a
+#  Bandit-flagged shell injection could still score "LIKELY SAFE". Severity
+#  mapping mirrors reporter/generate_report.py so the dashboard score card
+#  matches the per-tool badges shown in the HTML report.
+# ==============================================================================
+TOOL_COUNTS_FILE="$SCAN_ROOT/tool_severity_counts.txt"
+
+python3_run - <<PYEOF 2>>"$TOOLS_LOG" || true
+import json
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+        return json.loads(text) if text and text != "null" else default
+    except Exception:
+        return default
+
+c = h = m = l = 0
+
+bandit = load("$BANDIT_JSON", {"results": []})
+for r in bandit.get("results", []):
+    sev = str(r.get("issue_severity", "")).upper()
+    if sev == "HIGH":     h += 1
+    elif sev == "MEDIUM": m += 1
+    elif sev == "LOW":    l += 1
+
+semgrep = load("$SEMGREP_JSON", {"results": []})
+for r in semgrep.get("results", []):
+    sev = str(r.get("extra", {}).get("severity", "")).upper()
+    if sev == "ERROR":     h += 1
+    elif sev == "WARNING": m += 1
+    else:                  l += 1
+
+secrets = load("$SECRETS_JSON", {"results": {}})
+h += sum(len(v) for v in secrets.get("results", {}).values())
+
+gitleaks = load("$GITLEAKS_JSON", [])
+if isinstance(gitleaks, list):
+    c += len(gitleaks)
+
+pip_audit = load("$PIP_AUDIT_JSON", {"dependencies": []})
+h += sum(len(d.get("vulns", [])) for d in pip_audit.get("dependencies", []) if d.get("vulns"))
+
+with open("$TOOL_COUNTS_FILE", "w") as f:
+    f.write(f"{c} {h} {m} {l}\n")
+PYEOF
+
+if [[ -f "$TOOL_COUNTS_FILE" ]]; then
+    IFS=' ' read -r TOOL_C TOOL_H TOOL_M TOOL_L < "$TOOL_COUNTS_FILE"
+    CRITICAL=$((CRITICAL + ${TOOL_C:-0}))
+    HIGH=$((HIGH + ${TOOL_H:-0}))
+    MEDIUM=$((MEDIUM + ${TOOL_M:-0}))
+    LOW=$((LOW + ${TOOL_L:-0}))
+fi
 
 # ==============================================================================
 #  FINAL: Verdict
@@ -915,6 +1091,8 @@ fi
 section "FINAL VERDICT"
 
 python3_run - <<PYEOF | tee -a "$REPORT_TXT"
+import json
+
 C = $CRITICAL
 H = $HIGH
 M = $MEDIUM
@@ -934,41 +1112,47 @@ print(f"  {'Total':12}: {T:>4}")
 print(bar)
 
 if C > 0:
-    verdict = "🚨  AVOID — CRITICAL SECURITY RISKS DETECTED"
+    verdict_emoji = "🚨"
+    verdict_text  = "AVOID — CRITICAL SECURITY RISKS DETECTED"
     explain = (
         "One or more CRITICAL severity issues were found. "
         "This module should NOT be used until those are resolved. "
         "Review the CRITICAL findings above immediately."
     )
 elif H >= 3:
-    verdict = "❌  AVOID — MULTIPLE HIGH SEVERITY ISSUES"
+    verdict_emoji = "❌"
+    verdict_text  = "AVOID — MULTIPLE HIGH SEVERITY ISSUES"
     explain = (
         f"{H} HIGH severity issues were detected. "
         "Strong recommendation to avoid this package. "
         "If required, consult your security team before proceeding."
     )
 elif H > 0 or M >= 5:
-    verdict = "⚠️   USE WITH CAUTION — REVIEW FINDINGS BEFORE DEPLOYING"
+    verdict_emoji = "⚠️"
+    verdict_text  = "USE WITH CAUTION — REVIEW FINDINGS BEFORE DEPLOYING"
     explain = (
         "Several security concerns were identified. "
         "Manually review each HIGH/MEDIUM finding. "
         "Consider sandboxing or network-egress restrictions on the host."
     )
 elif M > 0 or L > 0:
-    verdict = "ℹ️   LOW RISK — MINOR ISSUES, STANDARD DUE DILIGENCE ADVISED"
+    verdict_emoji = "ℹ️"
+    verdict_text  = "LOW RISK — MINOR ISSUES, STANDARD DUE DILIGENCE ADVISED"
     explain = (
         "Only low/medium informational issues found. "
         "Apply standard security practices: venv isolation, "
         "principle of least privilege, and monitor runtime behaviour."
     )
 else:
-    verdict = "✅  LIKELY SAFE — No significant issues detected"
+    verdict_emoji = "✅"
+    verdict_text  = "LIKELY SAFE — No significant issues detected"
     explain = (
         "No critical, high, or medium issues were found by automated tools. "
         "Automated scanning has limits — always combine with manual review "
         "and runtime monitoring in production."
     )
 
+verdict = f"{verdict_emoji}  {verdict_text}"
 print(f"\n  VERDICT: {verdict}")
 print(f"\n  {explain}\n")
 print(bar)
@@ -982,57 +1166,103 @@ print("  5. Pin the exact version in requirements.txt + verify hash")
 print("     (pip install --require-hashes)")
 print("  6. Re-run this scanner after every version upgrade")
 print(bar)
+
+with open("$VERDICT_JSON", "w") as f:
+    json.dump({
+        "verdict": verdict_text,
+        "verdict_emoji": verdict_emoji,
+        "verdict_sub": explain,
+        "score": {"critical": C, "high": H, "medium": M, "low": L},
+    }, f)
 PYEOF
 
 # ==============================================================================
 #  Generate HTML Report (optional --html flag)
+#  Assembles meta.json from the structured data collected during the scan,
+#  then hands everything off to reporter/generate_report.py to build a full
+#  dashboard-style report (tables, severity badges, filters, GitHub deep
+#  links) instead of dumping the raw text log into a <pre> tag.
 # ==============================================================================
 if $GENERATE_HTML; then
     log "Generating HTML report …"
-    python3_run - <<PYEOF
-import html, datetime
 
-with open("$REPORT_TXT") as f:
-    raw = f.read()
+    FINISHED_EPOCH=$(date +%s)
+    DURATION_SECONDS=$((FINISHED_EPOCH - START_EPOCH))
+    FINISHED_AT_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    META_JSON="$SCAN_ROOT/meta.json"
 
-# Strip ANSI codes
-import re
-ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-clean = ansi_escape.sub('', raw)
+    RUN_ID="$TIMESTAMP" TARGET_URL="$TARGET_URL" PACKAGE_NAME_ENV="$PACKAGE_NAME" \
+    STARTED_AT="$STARTED_AT_ISO" FINISHED_AT="$FINISHED_AT_ISO" DURATION_SECONDS="$DURATION_SECONDS" \
+    IS_GITHUB="$IS_GITHUB" GITLEAKS_AVAILABLE="$HAS_GITLEAKS" \
+    PYPI_META_JSON="$PYPI_META_JSON" VERDICT_JSON="$VERDICT_JSON" \
+    META_JSON_OUT="$META_JSON" \
+    python3_run -c "
+import json, os
 
-body_html = html.escape(clean).replace('\n','<br>\n')
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+        return json.loads(text) if text else default
+    except Exception:
+        return default
 
-page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>PySentinel Report — $PACKAGE_NAME</title>
-<style>
-  body {{ font-family: 'Courier New', monospace; background:#0d1117; color:#c9d1d9;
-          padding:2rem; max-width:1100px; margin:auto; line-height:1.6; }}
-  h1   {{ color:#58a6ff; border-bottom:1px solid #30363d; padding-bottom:.5rem; }}
-  pre  {{ white-space:pre-wrap; word-break:break-word; }}
-  .badge-crit {{ color:#ff4d4d; font-weight:bold; }}
-  .badge-high {{ color:#ff8c00; font-weight:bold; }}
-  .badge-med  {{ color:#f0e68c; font-weight:bold; }}
-  .badge-ok   {{ color:#3fb950; font-weight:bold; }}
-  footer {{ margin-top:2rem; font-size:.8rem; color:#484f58; }}
-</style>
-</head>
-<body>
-<h1>🛡 PySentinel Security Report</h1>
-<p><strong>Package:</strong> $PACKAGE_NAME &nbsp;|&nbsp;
-   <strong>Scanned:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-<pre>{body_html}</pre>
-<footer>Generated by PySentinel v2.0 — for internal security review only</footer>
-</body>
-</html>"""
+pypi_meta = load_json(os.environ.get('PYPI_META_JSON', ''), {})
+verdict   = load_json(os.environ.get('VERDICT_JSON', ''), {})
 
-with open("$REPORT_HTML", "w") as f:
-    f.write(page)
+custom_findings = []
+jsonl = os.environ.get('CUSTOM_FINDINGS_JSONL', '')
+if jsonl and os.path.exists(jsonl):
+    with open(jsonl) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                custom_findings.append(json.loads(line))
+            except Exception:
+                pass
 
-print(f"  HTML report → $REPORT_HTML")
-PYEOF
+meta = {
+    'run_id': os.environ.get('RUN_ID', 'unknown'),
+    'target': os.environ.get('TARGET_URL', ''),
+    'package_name': os.environ.get('PACKAGE_NAME_ENV', ''),
+    'started_at': os.environ.get('STARTED_AT', ''),
+    'finished_at': os.environ.get('FINISHED_AT', ''),
+    'duration_seconds': int(os.environ.get('DURATION_SECONDS', '0') or 0),
+    'scanner_version': '2.1',
+    'is_github': os.environ.get('IS_GITHUB', '') == 'true',
+    'tools': {'gitleaks_available': os.environ.get('GITLEAKS_AVAILABLE', '') == 'true'},
+    'verdict': verdict.get('verdict', 'UNKNOWN'),
+    'verdict_emoji': verdict.get('verdict_emoji', '🔍'),
+    'verdict_sub': verdict.get('verdict_sub', ''),
+    'score': verdict.get('score', {'critical': 0, 'high': 0, 'medium': 0, 'low': 0}),
+    'pypi_info': pypi_meta.get('pypi_info', {}),
+    'metadata_flags': pypi_meta.get('metadata_flags', []),
+    'custom_findings': custom_findings,
+}
+
+with open(os.environ['META_JSON_OUT'], 'w') as f:
+    json.dump(meta, f)
+"
+
+    REPORTER_DIR="${PYSENTINEL_REPORTER:-$SCRIPT_REPORTER_DIR}"
+
+    if [[ -z "$REPORTER_DIR" || ! -f "$REPORTER_DIR/generate_report.py" ]]; then
+        warn "Reporter not found (looked in: ${REPORTER_DIR:-<unset>}) — skipping HTML report"
+    elif python3_run "$REPORTER_DIR/generate_report.py" \
+            --meta       "$META_JSON" \
+            --bandit     "$BANDIT_JSON" \
+            --semgrep    "$SEMGREP_JSON" \
+            --gitleaks   "$GITLEAKS_JSON" \
+            --secrets    "$SECRETS_JSON" \
+            --pip-audit  "$PIP_AUDIT_JSON" \
+            --output     "$REPORT_HTML" \
+            2>>"$TOOLS_LOG"; then
+        ok "HTML report → $REPORT_HTML"
+    else
+        warn "HTML report generation failed — see $TOOLS_LOG"
+    fi
 fi
 
 echo ""

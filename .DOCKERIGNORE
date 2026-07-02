@@ -1,0 +1,27 @@
+# ==============================================================================
+#  PySentinel — .dockerignore
+#
+#  Docker only needs these 4 files from the build context:
+#    scanner/pysentinel.sh
+#    reporter/generate_report.py
+#    reporter/assets/report.css
+#    reporter/assets/report.js
+#
+#  Everything else is excluded — keeps the build context under 100KB.
+# ==============================================================================
+
+# ── Exclude everything first, then whitelist what Docker actually needs ────────
+**
+
+# ── Whitelist: the scanner ─────────────────────────────────────────────────────
+!scanner/pysentinel.sh
+
+# ── Whitelist: the reporter ────────────────────────────────────────────────────
+!reporter/generate_report.py
+!reporter/assets/report.css
+!reporter/assets/report.js
+
+# NOTE: The reporter/ directory itself must be whitelisted for its children to work.
+# Docker requires parent directories to be included when using negation patterns.
+!reporter/
+!reporter/assets/

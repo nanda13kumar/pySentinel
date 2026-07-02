@@ -1,161 +1,207 @@
-# PySentinel v2.1 — Python Module Security Scanner
+# PySentinel v2.1
 
-A 360° security scanner for Python packages before you add them to your project.
-Feed it a PyPI name or a GitHub URL — it scans, reports, and cleans up.
+**360° Python module security scanner** — Feed it a PyPI name or GitHub URL, get a full security report with a SAFE / CAUTION / AVOID verdict.
+
+---
+
+## Folder structure
+
+```
+pysentinel/
+├── Dockerfile                  ← Image definition
+├── docker-compose.yml          ← Developer convenience
+├── scan.sh                     ← Single-command launcher (host)
+├── .dockerignore
+├── README.md
+├── scanner/
+│   └── pysentinel.sh           ← Core scan engine (14 steps)
+└── reporter/
+    ├── generate_report.py      ← HTML report generator
+    └── assets/
+        ├── report.css          ← Dark dashboard theme
+        └── report.js           ← Filter, search, collapsible UI
+```
 
 ---
 
 ## What it scans
 
-| # | Check | Tools |
+| Step | Check | Tool |
 |---|---|---|
-| 1 | PyPI metadata & typosquatting signals | PyPI JSON API |
-| 2 | Install-hook analysis (setup.py, pyproject.toml) | rg / grep |
-| 3 | Obfuscation & malware patterns (eval, exec, marshal, pickle…) | rg / grep |
-| 4 | Network exfiltration patterns (socket, requests.post, smtplib…) | rg / grep |
-| 5 | Filesystem credential snooping (/.ssh, /.aws, /etc/shadow…) | rg / grep |
-| 6 | Hardcoded secrets in current file tree | detect-secrets |
-| 7 | **Hardcoded secrets in full git history** | **gitleaks** |
-| 8 | SAST | bandit |
-| 9 | SAST (auto + p/python + p/security-audit + p/secrets) | semgrep |
-| 10 | CVE scan — full dependency tree | pip-audit |
-| 11 | CVE scan — Safety DB | safety |
-| 12 | `__init__.py` side-effect AST analysis | Python ast |
-| 13 | Non-Python file audit (binaries, .so, shell scripts) | file |
-| 14 | Verdict: SAFE / CAUTION / AVOID with scoring | — |
-
-All temp files removed on exit — guaranteed via `trap`.
+| 3 | PyPI metadata & typosquatting signals | PyPI JSON API |
+| 4 | Install-hook analysis (setup.py, pyproject.toml) | rg / grep |
+| 5 | Obfuscation & malware patterns | rg / grep |
+| 6 | Network exfiltration patterns | rg / grep |
+| 7 | Filesystem & credential snooping | rg / grep |
+| 7 | Hardcoded secrets — current files | detect-secrets |
+| 8 | **Hardcoded secrets — full git history** | **gitleaks** |
+| 9 | SAST | bandit |
+| 10 | SAST (auto + p/python + p/security-audit + p/secrets) | semgrep |
+| 11 | CVE scan — full dependency tree | pip-audit |
+| 12 | CVE scan — Safety DB | safety |
+| 13 | `__init__.py` side-effect AST analysis | Python ast |
+| 14 | Binary & shell script audit | file |
 
 ---
 
-## ✅ Already have the image? Jump straight to running scans
+## Developer Usage
 
-> **For colleagues who pulled the image from ECR (or any registry) —
-> no Dockerfile, no build, no setup required. Docker is all you need.**
+> For engineers running scans on their **local machine** from source.
 
-### Create a folder for your reports first (one-time)
+### Prerequisites
 
 ```bash
+# macOS
+brew install docker
+
+# Verify
+docker --version
+docker compose version
+```
+
+### 1 — Clone / get the files
+
+```
+pysentinel/
+├── Dockerfile
+├── docker-compose.yml
+├── scanner/pysentinel.sh
+└── reporter/
+    ├── generate_report.py
+    └── assets/{report.css, report.js}
+```
+
+### 2 — Build the image
+
+```bash
+# BuildKit must be on (handles the semgrep 34MB download gracefully)
+DOCKER_BUILDKIT=1 docker compose build
+```
+
+First build takes ~5 minutes (downloads semgrep, gitleaks, ripgrep).
+Subsequent builds are instant — layers are cached.
+
+### 3 — Run a scan
+
+```bash
+# Scan a PyPI package
+docker compose run --rm pysentinel nsepython
+
+# Scan a GitHub repository
+docker compose run --rm pysentinel https://github.com/aeron7/nsepython
+
+# With HTML report (opens from ./reports/*.html)
+docker compose run --rm pysentinel nsepython --html
+docker compose run --rm pysentinel https://github.com/aeron7/nsepython --html
+```
+
+Reports land in `./reports/` — a text report always, HTML when `--html` is passed.
+
+### 4 — Open the HTML report
+
+```bash
+# macOS
+open reports/pysentinel_*.html
+
+# Linux
+xdg-open reports/pysentinel_*.html
+```
+
+---
+
+## Production Usage
+
+> For DevOps / Platform engineers building and distributing the image.
+
+### Step 1 — Build the image
+
+```bash
+# Enable BuildKit (required for pip cache layer — avoids semgrep timeout)
+export DOCKER_BUILDKIT=1
+
+# Build and tag with ECR URI
+docker build \
+  -t <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
+  -t <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:latest \
+  .
+```
+
+### Step 2 — Authenticate to ECR
+
+```bash
+aws ecr get-login-password --region <REGION> \
+  | docker login --username AWS --password-stdin \
+    <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
+```
+
+### Step 3 — Push to ECR
+
+```bash
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:latest
+```
+
+### Step 4 — Colleagues pull and scan
+
+Colleagues need **only Docker**. No source files, no build step.
+
+```bash
+# Pull the image
+docker pull <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1
+
+# Create a reports folder
 mkdir -p ~/pysentinel-reports
-```
 
-### Scan a PyPI package
-
-```bash
+# Run a scan — text report
 docker run --rm \
   -v ~/pysentinel-reports:/home/scanner/pysentinel_reports \
-  <YOUR-ECR-ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
+  <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
   nsepython
-```
 
-### Scan a GitHub repository
-
-```bash
+# Run a scan — text + HTML report
 docker run --rm \
   -v ~/pysentinel-reports:/home/scanner/pysentinel_reports \
-  <YOUR-ECR-ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
-  https://github.com/aeron7/nsepython
-```
-
-### Get a text + HTML report
-
-```bash
-docker run --rm \
-  -v ~/pysentinel-reports:/home/scanner/pysentinel_reports \
-  <YOUR-ECR-ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
+  <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
   nsepython --html
+
+# Scan a GitHub URL
+docker run --rm \
+  -v ~/pysentinel-reports:/home/scanner/pysentinel_reports \
+  <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1 \
+  https://github.com/aeron7/nsepython --html
 ```
 
-Reports are saved to `~/pysentinel-reports/` on your machine.
-Open the `.html` file in any browser for a formatted view.
+### Optional — set an alias (saves retyping the image URI)
 
-### Tip — set a short alias so you don't retype the image name
-
-Add this to your `~/.bashrc` or `~/.zshrc`:
+Add to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-export PYSENTINEL_IMAGE="<YOUR-ECR-ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1"
+export PYSENTINEL_IMAGE="<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/pysentinel:2.1"
 alias pysentinel='docker run --rm -v ~/pysentinel-reports:/home/scanner/pysentinel_reports $PYSENTINEL_IMAGE'
 ```
 
-Then reload your shell:
+Reload shell:
 
 ```bash
 source ~/.bashrc    # or: source ~/.zshrc
 ```
 
-Now scan anything with a single word:
+Then:
 
 ```bash
-pysentinel nsepython
-pysentinel https://github.com/aeron7/nsepython
+pysentinel nsepython --html
 pysentinel requests --html
-pysentinel boto3 --html
+pysentinel https://github.com/org/repo --html
 ```
 
----
-
-## Option A — Shell Script (quick, individual use without Docker)
-
-### Prerequisites
+### Step 5 — Re-scan policy
 
 ```bash
-# Required
-brew install python3 git curl          # macOS
-apt install python3 git curl           # Ubuntu/Debian
-
-# Strongly recommended (adds git history scanning)
-brew install gitleaks                  # macOS
-# Linux:
-curl -sSfL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_$(uname -s)_x64.tar.gz \
-  | tar -xz -C /usr/local/bin
-
-# Optional (faster pattern scanning)
-brew install ripgrep                   # macOS
-apt install ripgrep                    # Ubuntu/Debian
+# Run after every dependency version upgrade
+pysentinel <package>==<new-version> --html
 ```
 
-### Run
-
-```bash
-chmod +x pysentinel.sh
-
-./pysentinel.sh nsepython
-./pysentinel.sh https://github.com/aeron7/nsepython
-./pysentinel.sh nsepython --html
-```
-
-Reports saved to `~/pysentinel_reports/`.
-
----
-
-## Option B — Docker (build from source)
-
-If you want to build the image yourself rather than pulling from ECR:
-
-```bash
-# 1. Put Dockerfile, pysentinel.sh, scan.sh, .dockerignore in one folder
-# 2. Make scan.sh executable
-chmod +x scan.sh
-
-# 3. Run — scan.sh builds the image automatically on first run
-./scan.sh nsepython
-./scan.sh https://github.com/aeron7/nsepython --html
-```
-
-`scan.sh` detects whether the image exists and builds it if not.
-Subsequent runs are instant — no rebuild.
-
-### Why Docker for teams?
-
-| | Shell script | Docker |
-|---|---|---|
-| Colleague setup | Install 6+ tools manually | `docker pull` — done |
-| Tool versions | Vary per machine | Pinned, identical for everyone |
-| gitleaks included | Must install separately | ✅ Pre-installed |
-| ripgrep included | Must install separately | ✅ Pre-installed |
-| Reproducible scans | Depends on host | ✅ Same result everywhere |
-| Extra isolation | Relies on venv | ✅ Full container sandbox |
+Most supply-chain attacks land in patch releases, not major versions.
 
 ---
 
@@ -163,24 +209,8 @@ Subsequent runs are instant — no rebuild.
 
 | Score | Verdict |
 |---|---|
-| Any Critical issue | 🚨 AVOID — Critical security risks |
-| ≥ 3 High issues | ❌ AVOID — Multiple high severity issues |
-| 1–2 High or ≥ 5 Medium | ⚠️ Use with caution — review before deploying |
-| Low / Medium only | ℹ️ Low risk — standard due diligence advised |
+| Any Critical | 🚨 AVOID — Critical security risks |
+| ≥ 3 High | ❌ AVOID — Multiple high severity issues |
+| 1–2 High or ≥ 5 Medium | ⚠️ Use with caution |
+| Low / Medium only | ℹ️ Low risk — standard due diligence |
 | Clean | ✅ Likely safe |
-
----
-
-## Answered: your original 4 questions
-
-1. **Is the code clean / malicious?** → Steps 2–5 (install hooks, obfuscation, network, FS snooping)
-2. **SAST tool?** → Bandit (Step 8) + Semgrep with `--config=auto` (Step 9)
-3. **CVE identification?** → pip-audit (Step 10) + Safety (Step 11)
-4. **Is it safe for your server?** → gitleaks (Step 7) + network pattern scan (Step 4) + FS snooping (Step 5)
-
----
-
-## Re-scan policy
-
-Run PySentinel **after every version upgrade** of a dependency.
-Most supply-chain attacks happen in patch releases, not major versions.
